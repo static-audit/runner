@@ -1,0 +1,465 @@
+# .github/workflows/scan.yml — equivalent GitHub Actions de docs/audit-depot-gitlab-ci.yml
+#
+# Ce fichier est destine au repo GitHub dedie github.com/static-audit/runner.
+# audit.fcne.fr declenche ce workflow via l'API GitHub :
+#   POST /repos/{owner}/{repo}/actions/workflows/scan.yml/dispatches
+#   { "ref": "main", "inputs": { "target_repo_url": "https://..." } }
+#
+# Puis recupere les artefacts JSON :
+#   GET  /repos/{owner}/{repo}/actions/runs/{run_id}/artifacts
+#   GET  /repos/{owner}/{repo}/actions/artifacts/{id}/zip
+#
+# Differences cles vs GitLab CI :
+#   - Chaque job tourne sur SA propre VM Ubuntu (2 vCPU / 7 Go RAM) →
+#     parallelisme reel garanti, plus de queue runner.
+#   - chromium est preinstalle sur ubuntu-latest → pa11y gagne 3-5 min.
+#   - Artefacts via actions/upload-artifact@v4 (telechargeable via REST API).
+#   - `continue-on-error: true` remplace `allow_failure: true`.
+
+name: Scan dépôt cible
+
+# `run-name` integre le correlation_id pour qu'audit.fcne.fr puisse
+# retrouver l'ID du run apres le dispatch (l'API workflow_dispatch ne
+# renvoie pas le run_id). Le service PHP genere un UUID, le passe en
+# input, puis grep la liste des runs recents par nom.
+run-name: scan ${{ inputs.correlation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo_url:
+        description: 'URL HTTPS du dépôt à analyser (forge.apps.education.fr)'
+        required: true
+      target_ref:
+        description: 'Branche / tag / SHA (défaut : main)'
+        required: false
+        default: 'main'
+      correlation_id:
+        description: 'UUID injecté par audit.fcne.fr pour retrouver ce run'
+        required: true
+
+# Annule un run precedent en cours pour le meme depot si un nouvel audit
+# est declenche entretemps. Evite l'accumulation de runs zombies.
+concurrency:
+  group: scan-${{ inputs.target_repo_url }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1. VALIDATION : URL non vide + pointe vers forge.apps.education.fr.
+  # ---------------------------------------------------------------------------
+  validate-input:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate URL
+        env:
+          TARGET_REPO_URL: ${{ inputs.target_repo_url }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          if [ -z "$TARGET_REPO_URL" ]; then
+            echo "ERREUR: target_repo_url est obligatoire."
+            exit 1
+          fi
+          if ! echo "$TARGET_REPO_URL" | grep -qE '^https://forge\.apps\.education\.fr/'; then
+            echo "ERREUR: target_repo_url doit pointer vers forge.apps.education.fr."
+            exit 1
+          fi
+          echo "Cible : $TARGET_REPO_URL ($TARGET_REF)"
+
+  # ---------------------------------------------------------------------------
+  # 2. PREPARE : clone shallow du depot cible, partage en artefact.
+  # ---------------------------------------------------------------------------
+  prepare:
+    needs: validate-input
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone target
+        env:
+          TARGET_REPO_URL: ${{ inputs.target_repo_url }}
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          mkdir -p src
+          git clone --depth=1 --branch "$TARGET_REF" "$TARGET_REPO_URL" src/target
+          du -sh src/target
+      - name: Upload target
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-src
+          path: src/target/
+          retention-days: 1
+          include-hidden-files: true
+
+  # ---------------------------------------------------------------------------
+  # 3. SCAN : 7 jobs parallèles, chacun sur sa VM dédiée.
+  # ---------------------------------------------------------------------------
+
+  semgrep:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+      - name: Scan
+        continue-on-error: true
+        run: |
+          echo '{"version":"unknown","results":[],"errors":[],"paths":{"scanned":[]}}' > semgrep-results.json
+          cd src/target
+          semgrep scan \
+            --config=p/security-audit \
+            --config=p/secrets \
+            --config=p/owasp-top-ten \
+            --json \
+            --output=../../semgrep-results.json \
+            --timeout=300 \
+            --max-target-bytes=2000000 \
+            --quiet || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+          retention-days: 7
+
+  gitleaks:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: zricethezav/gitleaks:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+      - name: Scan
+        continue-on-error: true
+        run: |
+          cd src/target
+          gitleaks detect \
+            --source=. \
+            --report-format=json \
+            --report-path=../../gitleaks-results.json \
+            --no-banner --redact || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-results
+          path: gitleaks-results.json
+          retention-days: 7
+
+  osv-scanner:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/google/osv-scanner:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+      - name: Scan
+        continue-on-error: true
+        run: |
+          echo '{"results":[]}' > osv-results.json
+          osv-scanner scan source --recursive --format json --output osv-results.json src/target/ || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: osv-results
+          path: osv-results.json
+          retention-days: 7
+
+  trivy:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: aquasec/trivy:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+      - name: Scan
+        continue-on-error: true
+        run: |
+          trivy fs \
+            --format json \
+            --output trivy-results.json \
+            --scanners vuln,misconfig,secret,license \
+            --severity CRITICAL,HIGH,MEDIUM,LOW \
+            --quiet \
+            src/target/ || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-results
+          path: trivy-results.json
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # pa11y : ubuntu-latest a Google Chrome preinstalle → pas d'apt-get,
+  # pas de pull chromium. Job qui prenait 7-10 min sur la forge tombe a ~2 min.
+  # ---------------------------------------------------------------------------
+  pa11y:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+      - name: Scan
+        continue-on-error: true
+        run: |
+          # Filet : artefact valide AVANT toute logique.
+          echo '{"total":0,"passes":0,"errors":0,"results":{}}' > pa11y-results.json
+          npm install -g --silent pa11y-ci || true
+          if ! command -v pa11y-ci > /dev/null 2>&1; then
+            echo "pa11y-ci introuvable, artefact vide."
+            exit 0
+          fi
+          cd src/target
+          find . -type f -name "*.html" \
+            \( -path "./*" -o -path "./public/*" -o -path "./dist/*" -o -path "./build/*" -o -path "./docs/*" \) \
+            -not -path "*/node_modules/*" \
+            -not -path "*/vendor/*" \
+            | head -n 30 > ../../pa11y-urls.txt 2>/dev/null || true
+          sed -i "s|^\./|file://$PWD/|" ../../pa11y-urls.txt 2>/dev/null || true
+          cd ../..
+          if [ ! -s pa11y-urls.txt ]; then
+            echo "Aucun HTML a scanner."
+            exit 0
+          fi
+          cat > pa11yci.json <<'JSON'
+          {
+            "defaults": {
+              "standard": "WCAG2AA",
+              "runners": ["axe", "htmlcs"],
+              "timeout": 30000,
+              "wait": 500,
+              "chromeLaunchConfig": {
+                "executablePath": "/usr/bin/google-chrome",
+                "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+              },
+              "ignore": []
+            }
+          }
+          JSON
+          pa11y-ci --config pa11yci.json --json $(cat pa11y-urls.txt | tr '\n' ' ') > pa11y-results.json 2>/dev/null || true
+          if [ ! -s pa11y-results.json ]; then
+            echo '{"total":0,"passes":0,"errors":0,"results":{}}' > pa11y-results.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pa11y-results
+          path: pa11y-results.json
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # ESLint + plugins securite/no-secrets : SAST JavaScript / TypeScript.
+  # ---------------------------------------------------------------------------
+  eslint:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+      - name: Scan
+        continue-on-error: true
+        run: |
+          echo "[]" > eslint-results.json
+          npm install -g --silent eslint@8 eslint-plugin-security eslint-plugin-no-secrets || true
+          if ! command -v eslint > /dev/null 2>&1; then
+            echo "eslint introuvable, artefact vide."
+            exit 0
+          fi
+          cat > /tmp/eslint.config.cjs <<'JSCONF'
+          module.exports = {
+            root: true,
+            env: { browser: true, node: true, es2022: true },
+            parserOptions: { ecmaVersion: 2022, sourceType: "module" },
+            plugins: ["security", "no-secrets"],
+            rules: {
+              "security/detect-eval-with-expression": "error",
+              "security/detect-non-literal-fs-filename": "warn",
+              "security/detect-non-literal-regexp": "warn",
+              "security/detect-non-literal-require": "warn",
+              "security/detect-object-injection": "warn",
+              "security/detect-possible-timing-attacks": "warn",
+              "security/detect-pseudoRandomBytes": "error",
+              "security/detect-unsafe-regex": "warn",
+              "no-secrets/no-secrets": ["error", { "tolerance": 4.5 }],
+              "no-eval": "error",
+              "no-implied-eval": "error",
+              "no-new-func": "error"
+            }
+          };
+          JSCONF
+          cd src/target
+          eslint --config /tmp/eslint.config.cjs --no-eslintrc \
+            --ext .js,.jsx,.ts,.tsx,.mjs,.cjs \
+            --ignore-pattern "node_modules/" \
+            --ignore-pattern "vendor/" \
+            --ignore-pattern "dist/" \
+            --ignore-pattern "build/" \
+            --format json \
+            . > ../../eslint-results.json 2>/dev/null || true
+          cd ../..
+          if [ ! -s eslint-results.json ]; then
+            echo "[]" > eslint-results.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eslint-results
+          path: eslint-results.json
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # html-validate : conformite HTML W3C.
+  # ---------------------------------------------------------------------------
+  html-validate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+      - name: Scan
+        continue-on-error: true
+        run: |
+          echo "[]" > html-validate-results.json
+          npm install -g --silent html-validate || true
+          if ! command -v html-validate > /dev/null 2>&1; then
+            echo "html-validate introuvable, artefact vide."
+            exit 0
+          fi
+          cd src/target
+          HTML_FILES=$(find . -type f -name "*.html" -not -path "*/node_modules/*" -not -path "*/vendor/*" | head -n 200 | tr '\n' ' ')
+          if [ -z "$HTML_FILES" ]; then
+            cd ../..
+            echo "Aucun fichier HTML a valider."
+            exit 0
+          fi
+          html-validate --formatter json $HTML_FILES > ../../html-validate-results.json 2>/dev/null || true
+          cd ../..
+          if [ ! -s html-validate-results.json ]; then
+            echo "[]" > html-validate-results.json
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: html-validate-results
+          path: html-validate-results.json
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # external-resources : appels CDN / webfonts / trackers (RGPD).
+  # ---------------------------------------------------------------------------
+  external-resources:
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      TARGET_REPO_URL: ${{ inputs.target_repo_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: target-src
+          path: src/target
+      - name: Install ripgrep
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep
+      - name: Scan
+        continue-on-error: true
+        shell: python
+        run: |
+          import json, os, re, subprocess, sys
+          from datetime import datetime, timezone
+
+          ROOT = "src/target"
+          PATTERNS = [
+              ("webfont", "fonts.googleapis.com"),
+              ("webfont", "fonts.gstatic.com"),
+              ("webfont", "use.typekit.net"),
+              ("webfont", "use.fontawesome.com"),
+              ("cdn", "cdn.jsdelivr.net"),
+              ("cdn", "cdnjs.cloudflare.com"),
+              ("cdn", "unpkg.com"),
+              ("cdn", "code.jquery.com"),
+              ("cdn", "stackpath.bootstrapcdn.com"),
+              ("cdn", "maxcdn.bootstrapcdn.com"),
+              ("tracker", "google-analytics.com"),
+              ("tracker", "googletagmanager.com"),
+              ("tracker", "connect.facebook.net"),
+              ("tracker", "static.hotjar.com"),
+              ("tracker", "script.hotjar.com"),
+              ("tracker", "www.clarity.ms"),
+          ]
+          EXTENSIONS = ["html", "htm", "vue", "jsx", "tsx", "js", "ts",
+                        "css", "scss", "php", "blade.php", "twig", "md"]
+
+          findings = []
+          for category, domain in PATTERNS:
+              glob = [f"--glob=*.{ext}" for ext in EXTENSIONS]
+              cmd = ["rg", "--no-messages", "--json",
+                     "--max-count=50",
+                     "-e", re.escape(domain),
+                     *glob, ROOT]
+              try:
+                  proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+              except Exception:
+                  continue
+              for raw in proc.stdout.splitlines():
+                  try:
+                      evt = json.loads(raw)
+                  except Exception:
+                      continue
+                  if evt.get("type") != "match":
+                      continue
+                  data = evt.get("data", {})
+                  path_obj = data.get("path", {}).get("text", "")
+                  line_no = data.get("line_number")
+                  line_text = data.get("lines", {}).get("text", "").strip()
+                  if not path_obj:
+                      continue
+                  rel = path_obj.removeprefix(ROOT + "/").lstrip("/")
+                  findings.append({
+                      "file": rel,
+                      "line": line_no,
+                      "category": category,
+                      "domain": domain,
+                      "url": domain,
+                      "snippet": line_text[:300],
+                  })
+
+          output = {
+              "tool": "external-resources",
+              "scanned_at": datetime.now(timezone.utc).isoformat(),
+              "target": os.environ.get("TARGET_REPO_URL", ""),
+              "findings": findings,
+          }
+          with open("external-resources-results.json", "w", encoding="utf-8") as f:
+              json.dump(output, f, ensure_ascii=False, indent=2)
+          print(f"External resources scan : {len(findings)} finding(s)")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: external-resources-results
+          path: external-resources-results.json
+          retention-days: 7
