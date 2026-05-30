@@ -82,6 +82,20 @@ jobs:
           mkdir -p src
           git clone --depth=1 --branch "$TARGET_REF" "$TARGET_REPO_URL" src/target
           du -sh src/target
+      - name: Strip invalid filenames
+        # actions/upload-artifact@v4 refuse les caracteres invalides sur
+        # NTFS (« ` < > | * ? : \r \n). Les depots committes depuis Windows
+        # contiennent parfois des `*:Zone.Identifier` (Alternate Data Streams
+        # marquant les fichiers « venant d'Internet »). On les supprime pour
+        # que l'upload n'echoue pas. Autres caracteres egalement nettoyes
+        # par precaution (cas rares mais bloquants identiques).
+        run: |
+          cd src/target
+          # `:` (Zone.Identifier et autres ADS)
+          find . -name '*:*' -print0 2>/dev/null | xargs -0 rm -f 2>/dev/null || true
+          # Autres caracteres interdits NTFS (rares)
+          find . \( -name '*"*' -o -name '*<*' -o -name '*>*' -o -name '*|*' -o -name '*?*' -o -name '*\**' \) -print0 2>/dev/null | xargs -0 rm -f 2>/dev/null || true
+          echo "Nettoyage termine."
       - name: Upload target
         uses: actions/upload-artifact@v4
         with:
