@@ -82,20 +82,20 @@ jobs:
           mkdir -p src
           git clone --depth=1 --branch "$TARGET_REF" "$TARGET_REPO_URL" src/target
           du -sh src/target
-      - name: Strip invalid filenames
+      - name: Strip Windows ADS files
         # actions/upload-artifact@v4 refuse les caracteres invalides sur
-        # NTFS (« ` < > | * ? : \r \n). Les depots committes depuis Windows
-        # contiennent parfois des `*:Zone.Identifier` (Alternate Data Streams
-        # marquant les fichiers « venant d'Internet »). On les supprime pour
-        # que l'upload n'echoue pas. Autres caracteres egalement nettoyes
-        # par precaution (cas rares mais bloquants identiques).
+        # NTFS dont `:`. Les depots committes depuis Windows contiennent
+        # parfois des `*:Zone.Identifier` (Alternate Data Streams marquant
+        # les fichiers « venant d'Internet »). On les supprime pour que
+        # l'upload n'echoue pas. On reste tres specifique pour ne pas
+        # detruire des fichiers legitimes — d'autres caracteres invalides
+        # (« < > | * ? \r \n) sont rares en pratique et provoqueraient
+        # une erreur explicite si presents, plutot qu'un faux succes.
         run: |
           cd src/target
-          # `:` (Zone.Identifier et autres ADS)
-          find . -name '*:*' -print0 2>/dev/null | xargs -0 rm -f 2>/dev/null || true
-          # Autres caracteres interdits NTFS (rares)
-          find . \( -name '*"*' -o -name '*<*' -o -name '*>*' -o -name '*|*' -o -name '*?*' -o -name '*\**' \) -print0 2>/dev/null | xargs -0 rm -f 2>/dev/null || true
-          echo "Nettoyage termine."
+          REMOVED=$(find . -type f -name '*:Zone.Identifier' 2>/dev/null | wc -l)
+          find . -type f -name '*:Zone.Identifier' -delete 2>/dev/null || true
+          echo "Fichiers Zone.Identifier supprimes : $REMOVED"
       - name: Upload target
         uses: actions/upload-artifact@v4
         with:
@@ -103,6 +103,9 @@ jobs:
           path: src/target/
           retention-days: 1
           include-hidden-files: true
+          # ÉCHEC si rien n'a ete uploade : evite que prepare reussisse
+          # silencieusement et que les 8 jobs aval echouent au download.
+          if-no-files-found: error
 
   # ---------------------------------------------------------------------------
   # 3. SCAN : 7 jobs parallèles, chacun sur sa VM dédiée.
