@@ -80,7 +80,15 @@ jobs:
           TARGET_REF: ${{ inputs.target_ref }}
         run: |
           mkdir -p src
-          git clone --depth=1 --branch "$TARGET_REF" "$TARGET_REPO_URL" src/target
+          # core.protectNTFS / core.protectHFS sont actives par defaut
+          # depuis git 2.40+ (CVE-2022-39253) et bloquent le checkout
+          # des depots contenant des paths avec `{`, `}`, `*`, `?`, etc.
+          # Cas reel : ferronier/ferronier contient le fichier
+          # `themes/.../content/description/{*.id}.description`.
+          # On audite en lecture seule sans jamais commiter dans le clone,
+          # donc on peut desactiver ces gardes sans risque.
+          git -c core.protectNTFS=false -c core.protectHFS=false \
+              clone --depth=1 --branch "$TARGET_REF" "$TARGET_REPO_URL" src/target
           du -sh src/target
       - name: Strip Windows ADS files
         # actions/upload-artifact@v4 refuse les caracteres invalides sur
