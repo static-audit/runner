@@ -90,20 +90,35 @@ jobs:
           git -c core.protectNTFS=false -c core.protectHFS=false \
               clone --depth=1 --branch "$TARGET_REF" "$TARGET_REPO_URL" src/target
           du -sh src/target
-      - name: Strip Windows ADS files
-        # actions/upload-artifact@v4 refuse les caracteres invalides sur
-        # NTFS dont `:`. Les depots committes depuis Windows contiennent
-        # parfois des `*:Zone.Identifier` (Alternate Data Streams marquant
-        # les fichiers « venant d'Internet »). On les supprime pour que
-        # l'upload n'echoue pas. On reste tres specifique pour ne pas
-        # detruire des fichiers legitimes — d'autres caracteres invalides
-        # (« < > | * ? \r \n) sont rares en pratique et provoqueraient
-        # une erreur explicite si presents, plutot qu'un faux succes.
+      - name: Strip paths invalid for upload-artifact
+        # actions/upload-artifact@v4 refuse tout chemin contenant
+        # `" : < > | * ? \r \n` (compatibilite NTFS, independant de
+        # core.protectNTFS de git). Cas reels rencontres :
+        #  - `*:Zone.Identifier` (Alternate Data Streams Windows)
+        #  - `{*.id}.description` (templates Hugo/Jekyll/etc. dans
+        #    ferronier/ferronier — caractere `*` dans le nom)
+        # Sans ce nettoyage, l'upload echoue avec "path not valid"
+        # et tous les jobs aval (semgrep, gitleaks, ...) plantent au
+        # download d'artefact, faisant croire a un echec des outils.
+        # On les supprime du clone (qui est jetable, audit en lecture
+        # seule) plutot que d'echouer tout l'audit.
         run: |
           cd src/target
-          REMOVED=$(find . -type f -name '*:Zone.Identifier' 2>/dev/null | wc -l)
-          find . -type f -name '*:Zone.Identifier' -delete 2>/dev/null || true
-          echo "Fichiers Zone.Identifier supprimes : $REMOVED"
+          # Liste tous les fichiers dont le path contient un char interdit.
+          # On exclut `/` (separateur de path POSIX) et on couvre :
+          #   *  ?  "  :  <  >  |
+          # \r et \n dans un nom de fichier sont exceptionnels et
+          # casseraient deja la plupart des outils — pas la peine de
+          # les gerer specialement (find -print0 / xargs -0 suffirait).
+          INVALID=$(find . -type f -regextype posix-extended -regex '.*[*?":<>|].*' 2>/dev/null || true)
+          if [ -n "$INVALID" ]; then
+            COUNT=$(echo "$INVALID" | wc -l)
+            echo "Fichiers avec caracteres interdits pour upload-artifact ($COUNT) :"
+            echo "$INVALID"
+            echo "$INVALID" | while IFS= read -r f; do rm -f "$f" 2>/dev/null || true; done
+          else
+            echo "Aucun fichier avec caracteres interdits."
+          fi
       - name: Upload target
         uses: actions/upload-artifact@v4
         with:
